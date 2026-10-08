@@ -1,5 +1,5 @@
 python-telegram-bot[webhooks]==20.6
-yt-dlp==2025.10.22
+yt-dlp
 requests==2.32.3
 nest_asyncio==1.6.0
 gunicorn==23.0.0
