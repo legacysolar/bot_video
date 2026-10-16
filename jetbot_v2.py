@@ -7,6 +7,7 @@ além de ampliar as plataformas suportadas.
 
 import asyncio
 import base64
+import copy
 import os
 import re
 import secrets
@@ -100,13 +101,35 @@ def _cookie_payload(platform: str):
         platform,
         (f"COOKIES_{platform.upper()}", f"COOKIES_{platform.upper()}_B64"),
     )
-    if os.environ.get(plain_key):
-        return os.environ[plain_key]
-    if os.environ.get(b64_key):
+    aliases = {
+        "twitter": ("TWITTER", "X"),
+        "youtube": ("YOUTUBE", "YT"),
+        "instagram": ("INSTAGRAM", "IG"),
+    }.get(platform, (platform.upper(),))
+    for key in dict.fromkeys([plain_key, *(f"COOKIES_{name}" for name in aliases)]):
+        if os.environ.get(key, "").strip():
+            return os.environ[key]
+    for key in dict.fromkeys([b64_key, *(f"COOKIES_{name}_B64" for name in aliases)]):
+        if os.environ.get(key):
+            try:
+                encoded = "".join(os.environ[key].split())
+                payload = base64.b64decode(encoded, validate=True).decode("utf-8")
+                if payload.strip():
+                    return payload
+            except (ValueError, UnicodeError):
+                print(f"[JetBot] Cookie B64 inválido: {key} (valor omitido)")
+    # Render Secret Files are mounted at /etc/secrets, not in the repository.
+    # Copy their contents into a temporary writable cookie jar for yt-dlp.
+    for name in aliases:
+        configured = os.environ.get(f"COOKIES_{name}_FILE")
+        path = Path(configured) if configured else Path("/etc/secrets") / f"cookies_{name.lower()}.txt"
         try:
-            return base64.b64decode(os.environ[b64_key]).decode("utf-8")
-        except Exception as exc:
-            print(f"Cookie B64 inválido para {platform}: {exc}")
+            if path.is_file():
+                payload = path.read_text(encoding="utf-8")
+                if payload.strip():
+                    return payload
+        except (OSError, UnicodeError):
+            print(f"[JetBot] Arquivo de cookies indisponível para {platform} (conteúdo omitido)")
     if os.environ.get("COOKIES_B64"):
         try:
             return base64.b64decode(os.environ["COOKIES_B64"]).decode("utf-8")
@@ -361,6 +384,43 @@ def build_general_ydl_options(temp_dir: Path, platform: str, cookiefile=None):
     return opts
 
 
+def _extract_general_media(url, opts, platform):
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError as original_error:
+        message = str(original_error).lower()
+        private = any(marker in message for marker in (
+            "private", "protected account", "protected tweet", "deleted", "does not exist",
+        ))
+        retryable = any(marker in message for marker in (
+            "cookies", "login", "sign in", "not authorized", "guest token", "csrf",
+            "graphql", "http error 401", "http error 403", "http error 404", "http error 429",
+        ))
+        if platform != "twitter" or private or not retryable:
+            raise
+        # yt-dlp supports X's public embed endpoint. Expired account cookies
+        # must not prevent an otherwise public video from being downloaded.
+        # This endpoint cannot expose protected/private posts.
+        public_opts = copy.deepcopy(opts)
+        for key in ("cookiefile", "cookiesfrombrowser", "username", "password"):
+            public_opts.pop(key, None)
+        public_opts["http_headers"] = {
+            key: value for key, value in public_opts.get("http_headers", {}).items()
+            if key.lower() not in {"cookie", "authorization"}
+        }
+        public_opts.setdefault("extractor_args", {}).setdefault("twitter", {})["api"] = ["syndication"]
+        public_opts["extractor_retries"] = 0
+        print("[JetBot X] Tentando endpoint público após falha de autenticação/API")
+        try:
+            with yt_dlp.YoutubeDL(public_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError:
+            # Keep the original authentication error actionable when the post
+            # is unavailable through the public endpoint too.
+            raise original_error from None
+
+
 def download_media(url: str, uid: int):
     """Motor V2 para todas as plataformas exceto YouTube."""
     platform = detect_platform(url)
@@ -400,8 +460,7 @@ def download_media(url: str, uid: int):
                     }
 
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = _extract_general_media(url, opts, platform)
             media = _find_media(temp_dir, ".mp4")
             if not media:
                 raise RuntimeError("Arquivo final não encontrado.")
@@ -596,7 +655,14 @@ async def baixar_video(update, context):
     except yt_dlp.utils.DownloadError as exc:
         message = str(exc).lower()
         if "cookies" in message or "login" in message or "sign in" in message:
-            text = "A plataforma exigiu autenticação/cookies. Configure-os apenas nos Secrets do Render."
+            if platform == "twitter":
+                text = (
+                    "O X não liberou este vídeo pela sessão atual nem pelo acesso público. "
+                    "O administrador precisa renovar os cookies do X no Render "
+                    "(COOKIES_X_B64 ou COOKIES_TWITTER_B64)."
+                )
+            else:
+                text = "A plataforma exigiu autenticação/cookies. Configure-os apenas nos Secrets do Render."
         else:
             text = "Não foi possível baixar esse link. Ele pode ser privado, removido ou protegido."
         await status.edit_text(f"❌ {text}")
